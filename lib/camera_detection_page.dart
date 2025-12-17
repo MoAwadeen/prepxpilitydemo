@@ -4,7 +4,6 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:image/image.dart' as image_lib;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
 class CameraDetectionPage extends StatefulWidget {
@@ -231,28 +230,14 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
   }
 
   Future<List<Map<String, dynamic>>> _runInference(CameraImage image) async {
-    final rgbImage = _convertYUV420ToImage(image);
-    final resized =
-        image_lib.copyResize(rgbImage, width: _inputSize, height: _inputSize);
-
-    final input = Float32List(_inputSize * _inputSize * 3);
-    int idx = 0;
-    for (int y = 0; y < _inputSize; y++) {
-      for (int x = 0; x < _inputSize; x++) {
-        final pixel = resized.getPixel(x, y);
-        input[idx++] = (image_lib.getRed(pixel) / 255.0);
-        input[idx++] = (image_lib.getGreen(pixel) / 255.0);
-        input[idx++] = (image_lib.getBlue(pixel) / 255.0);
-      }
-    }
-
-    final inputTensor = input.reshape([1, _inputSize, _inputSize, 3]);
+    final rgbBytes = _convertYUV420ToRGB(image);
+    final input = _resizeAndNormalize(rgbBytes, image.width, image.height);
 
     final outputShape = _interpreter!.getOutputTensor(0).shape;
     final outputLen = outputShape.reduce((a, b) => a * b);
     final outputBuffer = Float32List(outputLen);
 
-    _interpreter!.run(inputTensor, outputBuffer);
+    _interpreter!.run(input, outputBuffer);
 
     final results = <Map<String, dynamic>>[];
     final maxResults = min(3, outputLen);
@@ -269,23 +254,25 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
     return results.take(maxResults).toList();
   }
 
-  image_lib.Image _convertYUV420ToImage(CameraImage image) {
+  Uint8List _convertYUV420ToRGB(CameraImage image) {
     final width = image.width;
     final height = image.height;
     final uvRowStride = image.planes[1].bytesPerRow;
     final uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+    final rgbBuffer = Uint8List(width * height * 3);
 
-    final imageBuffer = image_lib.Image(width: width, height: height);
-
+    int bufferIndex = 0;
     for (int y = 0; y < height; y++) {
       final uvRow = uvRowStride * (y >> 1);
+      final yRow = image.planes[0].bytesPerRow * y;
       for (int x = 0; x < width; x++) {
         final uvIndex = uvRow + (x >> 1) * uvPixelStride;
-        final yValue = image.planes[0].bytes[y * image.planes[0].bytesPerRow + x];
+        final yValue = image.planes[0].bytes[yRow + x];
         final uValue = image.planes[1].bytes[uvIndex];
         final vValue = image.planes[2].bytes[uvIndex];
 
-        final r = (yValue + (1.370705 * (vValue - 128))).clamp(0, 255).toInt();
+        final r =
+            (yValue + (1.370705 * (vValue - 128))).clamp(0, 255).toInt();
         final g = (yValue -
                 (0.337633 * (uValue - 128)) -
                 (0.698001 * (vValue - 128)))
@@ -294,11 +281,34 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
         final b =
             (yValue + (1.732446 * (uValue - 128))).clamp(0, 255).toInt();
 
-        imageBuffer.setPixelRgb(x, y, r, g, b);
+        rgbBuffer[bufferIndex++] = r;
+        rgbBuffer[bufferIndex++] = g;
+        rgbBuffer[bufferIndex++] = b;
       }
     }
 
-    return imageBuffer;
+    return rgbBuffer;
+  }
+
+  Float32List _resizeAndNormalize(
+      Uint8List rgbBytes, int srcWidth, int srcHeight) {
+    final output = Float32List(_inputSize * _inputSize * 3);
+    final xScale = srcWidth / _inputSize;
+    final yScale = srcHeight / _inputSize;
+
+    int outIndex = 0;
+    for (int y = 0; y < _inputSize; y++) {
+      final sy = min((y * yScale).floor(), srcHeight - 1);
+      for (int x = 0; x < _inputSize; x++) {
+        final sx = min((x * xScale).floor(), srcWidth - 1);
+        final srcIndex = (sy * srcWidth + sx) * 3;
+        output[outIndex++] = rgbBytes[srcIndex] / 255.0;
+        output[outIndex++] = rgbBytes[srcIndex + 1] / 255.0;
+        output[outIndex++] = rgbBytes[srcIndex + 2] / 255.0;
+      }
+    }
+
+    return output;
   }
 }
 

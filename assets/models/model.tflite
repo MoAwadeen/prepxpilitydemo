@@ -1,0 +1,6 @@
+Placeholder model file.
+
+Replace this file with your TensorFlow Lite model (e.g. MobileNet, custom
+detector). Keep the same filename so the Flutter code can load it from
+`assets/models/model.tflite`.
+

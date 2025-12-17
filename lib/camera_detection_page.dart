@@ -1,7 +1,11 @@
+import 'dart:math';
+import 'dart:typed_data';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:tflite_v2/tflite_v2.dart';
+import 'package:image/image.dart' as image_lib;
+import 'package:tflite_flutter/tflite_flutter.dart';
 
 class CameraDetectionPage extends StatefulWidget {
   const CameraDetectionPage({super.key});
@@ -13,10 +17,14 @@ class CameraDetectionPage extends StatefulWidget {
 class _CameraDetectionPageState extends State<CameraDetectionPage>
     with WidgetsBindingObserver {
   CameraController? _controller;
+  Interpreter? _interpreter;
+  List<String> _labels = [];
   bool _isProcessingFrame = false;
   bool _modelLoaded = false;
   String _status = 'Loading model...';
   List<dynamic> _results = [];
+
+  static const int _inputSize = 224;
 
   @override
   void initState() {
@@ -32,22 +40,10 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
 
   Future<void> _loadModel() async {
     try {
-      final data = await rootBundle.load('assets/models/model.tflite');
-      if (data.lengthInBytes < 1024) {
-        setState(() {
-          _status =
-              'Placeholder model detected. Replace assets/models/model.tflite with your TFLite file.';
-          _modelLoaded = false;
-        });
-        return;
-      }
-
-      await Tflite.close();
-      await Tflite.loadModel(
-        model: 'assets/models/model.tflite',
-        labels: 'assets/models/labels.txt',
-        numThreads: 2,
-        isAsset: true,
+      _labels = await _loadLabels();
+      _interpreter = await Interpreter.fromAsset(
+        'assets/models/model.tflite',
+        options: InterpreterOptions()..threads = 2,
       );
 
       setState(() {
@@ -59,6 +55,19 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
         _modelLoaded = false;
         _status = 'Model load failed: $e';
       });
+    }
+  }
+
+  Future<List<String>> _loadLabels() async {
+    try {
+      final raw = await rootBundle.loadString('assets/models/labels.txt');
+      return raw
+          .split('\n')
+          .map((line) => line.trim())
+          .where((line) => line.isNotEmpty && !line.startsWith('#'))
+          .toList();
+    } catch (_) {
+      return [];
     }
   }
 
@@ -110,31 +119,22 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
   }
 
   void _onCameraImage(CameraImage image) async {
-    if (!_modelLoaded || _isProcessingFrame) {
+    if (!_modelLoaded || _interpreter == null || _isProcessingFrame) {
       return;
     }
 
     _isProcessingFrame = true;
 
     try {
-      final orientation = _controller?.description.sensorOrientation ?? 0;
-      final recognitions = await Tflite.runModelOnFrame(
-        bytesList: image.planes.map((plane) => plane.bytes).toList(),
-        imageHeight: image.height,
-        imageWidth: image.width,
-        numResults: 3,
-        threshold: 0.5,
-        rotation: orientation,
-        asynch: true,
-      );
+      final results = await _runInference(image);
 
       if (!mounted) {
         return;
       }
 
       setState(() {
-        _results = recognitions ?? [];
-        _status = 'Running detection...';
+        _results = results;
+        _status = results.isEmpty ? 'No confident results' : 'Running detection...';
       });
     } catch (e) {
       if (mounted) {
@@ -168,7 +168,7 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _controller?.dispose();
-    Tflite.close();
+    _interpreter?.close();
     super.dispose();
   }
 
@@ -221,13 +221,84 @@ class _CameraDetectionPageState extends State<CameraDetectionPage>
   String _formatResult(dynamic result) {
     if (result is Map) {
       final label = result['label'] ?? 'Unknown';
-      final confidence = result['confidence'] ?? result['confidenceInClass'];
+      final confidence = result['confidence'];
       if (confidence is num) {
         return '$label — ${(confidence * 100).toStringAsFixed(1)}%';
       }
       return '$label';
     }
     return result.toString();
+  }
+
+  Future<List<Map<String, dynamic>>> _runInference(CameraImage image) async {
+    final rgbImage = _convertYUV420ToImage(image);
+    final resized =
+        image_lib.copyResize(rgbImage, width: _inputSize, height: _inputSize);
+
+    final input = Float32List(_inputSize * _inputSize * 3);
+    int idx = 0;
+    for (int y = 0; y < _inputSize; y++) {
+      for (int x = 0; x < _inputSize; x++) {
+        final pixel = resized.getPixel(x, y);
+        input[idx++] = (image_lib.getRed(pixel) / 255.0);
+        input[idx++] = (image_lib.getGreen(pixel) / 255.0);
+        input[idx++] = (image_lib.getBlue(pixel) / 255.0);
+      }
+    }
+
+    final inputTensor = input.reshape([1, _inputSize, _inputSize, 3]);
+
+    final outputShape = _interpreter!.getOutputTensor(0).shape;
+    final outputLen = outputShape.reduce((a, b) => a * b);
+    final outputBuffer = Float32List(outputLen);
+
+    _interpreter!.run(inputTensor, outputBuffer);
+
+    final results = <Map<String, dynamic>>[];
+    final maxResults = min(3, outputLen);
+    for (int i = 0; i < outputLen; i++) {
+      final confidence = outputBuffer[i];
+      results.add({
+        'index': i,
+        'label': i < _labels.length ? _labels[i] : 'Label $i',
+        'confidence': confidence,
+      });
+    }
+    results.sort((a, b) => (b['confidence'] as double)
+        .compareTo(a['confidence'] as double));
+    return results.take(maxResults).toList();
+  }
+
+  image_lib.Image _convertYUV420ToImage(CameraImage image) {
+    final width = image.width;
+    final height = image.height;
+    final uvRowStride = image.planes[1].bytesPerRow;
+    final uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
+
+    final imageBuffer = image_lib.Image(width: width, height: height);
+
+    for (int y = 0; y < height; y++) {
+      final uvRow = uvRowStride * (y >> 1);
+      for (int x = 0; x < width; x++) {
+        final uvIndex = uvRow + (x >> 1) * uvPixelStride;
+        final yValue = image.planes[0].bytes[y * image.planes[0].bytesPerRow + x];
+        final uValue = image.planes[1].bytes[uvIndex];
+        final vValue = image.planes[2].bytes[uvIndex];
+
+        final r = (yValue + (1.370705 * (vValue - 128))).clamp(0, 255).toInt();
+        final g = (yValue -
+                (0.337633 * (uValue - 128)) -
+                (0.698001 * (vValue - 128)))
+            .clamp(0, 255)
+            .toInt();
+        final b =
+            (yValue + (1.732446 * (uValue - 128))).clamp(0, 255).toInt();
+
+        imageBuffer.setPixelRgb(x, y, r, g, b);
+      }
+    }
+
+    return imageBuffer;
   }
 }
 

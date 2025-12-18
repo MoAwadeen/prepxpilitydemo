@@ -36,7 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   camera: 0.11.3
   image: 4.0.0
-  tflite_flutter: 0.10.1
+  tflite_flutter: ^0.12.1
 
 dev_dependencies:
   flutter_test:
@@ -61,7 +61,7 @@ flutter:
   uses-material-design: true
 
   assets:
-    - assets/models/model.tflite
+    - assets/models/best_float16.tflite
     - assets/models/labels.txt
 
   # To add assets to your application, add an assets section, like this:
